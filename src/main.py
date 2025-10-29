@@ -500,7 +500,7 @@ class GherkinPipeline:
     def generate_no_analysis_dataset(self, final_file: Path) -> Path:
         """
         Gera uma cópia do dataset final sem os objetos 'analysis' e 'cleaning_metadata'
-        em cada entrada. Salva como consolidated_dataset{timestamp}.json dentro
+        em cada entrada. Salva como consolidated_dataset_{timestamp}.json dentro
         do diretório final.
         """
         try:
@@ -523,7 +523,7 @@ class GherkinPipeline:
             else:
                 stripped.append(entry)
 
-        no_analysis_file = self.dirs['final'] / f'consolidated_dataset{self.timestamp}.json'
+        no_analysis_file = self.dirs['final'] / f'consolidated_dataset_{self.timestamp}.json'
         self._save_json(stripped, no_analysis_file)
         self.stats['final_no_analysis_file'] = str(no_analysis_file)
         self.logger.info(f"✅ Arquivo sem 'analysis' e 'cleaning_metadata' criado: {no_analysis_file} ({len(stripped)} entradas)")
