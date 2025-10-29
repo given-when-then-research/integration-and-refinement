@@ -1,26 +1,14 @@
-import json
 import re
 import os
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Set
 from datetime import datetime
 import logging
-
-"""
-GherkinStepCleaner (melhorado)
-- Extração mais robusta para Java/Kotlin/Scala (JVM), Ruby, JavaScript/TypeScript/Node.js
-- Tratamento de comentários de bloco /* ... */ e strings (mantendo alinhamento de linhas)
-- Extração avançada para Node.js/TS com aspas aninhadas e template literals
-- Melhor detecção de limites de método (assinaturas multilinha, anotações comentadas)
-- Normalização e unescape mais seguros
-- Logging detalhado e estatísticas
-- Proteções contra entradas None/vazias
-- Remove_excess_steps protege contra sobreposição de ranges e preserva formato quando possível
-"""
 
 class GherkinStepCleaner:
     """
     Remove métodos de step definitions excessivos de arquivos de teste Gherkin.
     Suporta: Java, Kotlin, Scala, Ruby, JavaScript, TypeScript, Node.js
+    Com análise de dependências internas entre steps.
     """
 
     def __init__(self, log_dir: str = "logs"):
@@ -29,50 +17,17 @@ class GherkinStepCleaner:
         self.setup_logging()
         self._setup_patterns()
         self.logger.info("GherkinStepCleaner inicializado")
-        self.logger.info(f"Linguagens suportadas: {', '.join(self.get_supported_languages())}")
-        self.logger.info(f"Diretório de logs: {os.path.abspath(self.log_dir)}")
 
     def _setup_patterns(self):
         """Configura padrões de regex para cada linguagem"""
-        # Helpers para conteúdos entre aspas
-        dq_content = r'(?:\\.|[^"\\])*'
-        sq_content = r"(?:\\.|[^'\\])*"
-        bt_content = r'(?:\\.|[^`\\])*'
-
-        step_str_dq = rf'"({dq_content})"'
-        step_str_sq = rf"'({sq_content})'"
-        step_str_bt = rf'`({bt_content})`'
-
         self.patterns = {
-            'java': {
-                'step_annotation': rf'@(Given|When|Then|And|But)\s*\(\s*(?:{step_str_dq}|{step_str_sq})\s*\)',
-                'language_family': 'jvm'
-            },
-            'kotlin': {
-                'step_annotation': rf'@(Given|When|Then|And|But)\s*\(\s*(?:{step_str_dq}|{step_str_sq}|{step_str_bt})\s*\)',
-                'language_family': 'jvm'
-            },
-            'scala': {
-                'step_annotation': rf'@(Given|When|Then|And|But)\s*\(\s*(?:{step_str_dq}|{step_str_sq})\s*\)',
-                'language_family': 'jvm'
-            },
-            'ruby': {
-                # Ruby pode usar Given / 'text' do OR Given 'text' do OR regex
-                'step_annotation': rf'\b(Given|When|Then|And|But)\b\s*(?:\(?\s*(?:/([^/]+)/|{step_str_dq}|{step_str_sq}|{step_str_bt})\s*\)?\s*(?:do|\{{)?)',
-                'language_family': 'ruby'
-            },
-            'javascript': {
-                'step_annotation': rf'\b(Given|When|Then|And|But|defineStep)\s*\(\s*(?:{step_str_dq}|{step_str_sq}|{step_str_bt}|/([^/]+)/)',
-                'language_family': 'js'
-            },
-            'typescript': {
-                'step_annotation': rf'\b(Given|When|Then|And|But|defineStep)\s*\(\s*(?:{step_str_dq}|{step_str_sq}|{step_str_bt}|/([^/]+)/)',
-                'language_family': 'js'
-            },
-            'nodejs': {
-                'step_annotation': rf'\b(Given|When|Then|And|But|defineStep)\s*\(\s*(?:{step_str_dq}|{step_str_sq}|{step_str_bt}|/([^/]+)/)',
-                'language_family': 'js'
-            }
+            'java': {'language_family': 'jvm'},
+            'kotlin': {'language_family': 'jvm'},
+            'scala': {'language_family': 'jvm'},
+            'ruby': {'language_family': 'ruby'},
+            'javascript': {'language_family': 'js'},
+            'typescript': {'language_family': 'js'},
+            'nodejs': {'language_family': 'js'}
         }
 
     def get_supported_languages(self) -> List[str]:
@@ -92,431 +47,499 @@ class GherkinStepCleaner:
             fh.setFormatter(fmt)
             self.logger.addHandler(fh)
 
-    # -----------------------------
-    # Utilities for masking content
-    # -----------------------------
-    def _mask_block_comments_and_strings(self, content: str) -> str:
+    def normalize_pattern_for_matching(self, pattern: str) -> str:
         """
-        Retorna uma version de 'content' onde conteúdo de strings e comentários de bloco
-        foi substituído por espaços preservando quebras de linha e comprimento de cada linha.
-        Isso permite localizar anotações sem confundir strings/comentários, mantendo indices de linha.
+        Normaliza um pattern de regex para matching flexível.
+        Remove âncoras (^, $), espaços extras, mas mantém a estrutura do regex.
         """
-        if content is None:
+        if not pattern:
             return ""
+        
+        normalized = pattern.strip()
+        if normalized.startswith('^'):
+            normalized = normalized[1:]
+        if normalized.endswith('$'):
+            normalized = normalized[:-1]
+        
+        normalized = re.sub(r'\s+', ' ', normalized.strip())
+        normalized = normalized.strip('/')
+        
+        return normalized
 
-        # Remove CR for consistent handling
-        content = content.replace('\r\n', '\n').replace('\r', '\n')
+    def extract_step_pattern_ruby(self, line: str) -> Optional[str]:
+        """Extrai o pattern exato de um step definition Ruby."""
+        # Tenta capturar /regex/
+        match = re.search(r'^\s*(?:Given|When|Then|And|But)\s*\(\s*/(.+?)/', line)
+        if match:
+            return match.group(1)
+        
+        # Tenta capturar "string" ou 'string'
+        match = re.search(r'^\s*(?:Given|When|Then|And|But)\s*\(\s*["\'](.+?)["\']', line)
+        if match:
+            return match.group(1)
+        
+        return None
 
-        # mask block comments /* ... */ (preserve newlines inside)
-        def _block_repl(m):
-            s = m.group(0)
-            return re.sub(r'[^\n]', ' ', s)  # preserve newlines
-        content = re.sub(r'/\*.*?\*/', _block_repl, content, flags=re.DOTALL)
+    def extract_step_pattern_js(self, line: str) -> Optional[str]:
+        """Extrai o pattern exato de um step definition JS/TS."""
+        match = re.search(r'(?:Given|When|Then|And|But|defineStep)\s*\(\s*(["\'\`])(.+?)\1', line)
+        if match:
+            return match.group(2)
+        return None
 
-        # mask single line comments //...
-        content = re.sub(r'//.*?$', lambda m: ' ' * len(m.group(0)), content, flags=re.MULTILINE)
+    def extract_step_pattern_jvm(self, line: str) -> Optional[str]:
+        """Extrai o pattern exato de um step definition JVM."""
+        match = re.search(r'@(?:Given|When|Then|And|But)\s*\(\s*["\'](.+?)["\']', line)
+        if match:
+            return match.group(1)
+        return None
 
-        # mask strings '...', "..." and `...` (including escapes) preserving newlines
-        def _string_repl(m):
-            s = m.group(0)
-            return re.sub(r'[^\n]', ' ', s)
-        content = re.sub(r'"(?:\\.|[^"\\])*"', _string_repl, content)
-        content = re.sub(r"'(?:\\.|[^'\\])*'", _string_repl, content)
-        content = re.sub(r'`(?:\\.|[^`\\])*`', _string_repl, content)
+    def extract_step_pattern(self, line: str, language: str) -> Optional[str]:
+        """Extrai o pattern de step definition baseado na linguagem."""
+        family = self.patterns[language]['language_family']
+        
+        if family == 'ruby':
+            return self.extract_step_pattern_ruby(line)
+        elif family == 'js':
+            return self.extract_step_pattern_js(line)
+        elif family == 'jvm':
+            return self.extract_step_pattern_jvm(line)
+        
+        return None
 
-        return content
-
-    # -----------------------------
-    # Unescape & normalization
-    # -----------------------------
-    def safe_unescape_backslash(self, text: str) -> str:
-        if text is None:
-            return ""
-        result = text
-        # common escapes
-        replacements = [
-            (r'\\n', ' '), (r'\\t', ' '), (r'\\r', ''),
-            (r'\\u0022', '"'), (r'\\u0027', "'"), (r'\\u0060', '`'),
+    def find_internal_step_references_ruby(self, method_body: str) -> List[str]:
+        """
+        Encontra referências a outros steps dentro de um método Ruby.
+        Detecta patterns como: steps %( Given "..." Then "..." )
+        """
+        references = []
+        
+        self.logger.debug(f"  Analisando corpo do método para referências internas...")
+        
+        # Procurar por blocos steps %( ... ) ou steps %{ ... }
+        patterns = [
+            r'steps\s+%\(\s*(.+?)\s*\)',  # steps %( ... )
+            r'steps\s+%\{\s*(.+?)\s*\}',  # steps %{ ... }
+            r'steps\s+%\[\s*(.+?)\s*\]',  # steps %[ ... ]
         ]
-        for a, b in replacements:
-            result = result.replace(a, b)
-        # remove backslash escapes like \" \' \`
-        result = result.replace(r'\"', '"').replace(r"\'", "'").replace(r'\`', '`')
-        # collapse double backslashes first
-        result = result.replace('\\\\', '\\')
-        # strip remaining backslash before alphanum
-        result = re.sub(r'\\([A-Za-z0-9_])', r'\1', result)
-        return result
+        
+        for pattern in patterns:
+            for match in re.finditer(pattern, method_body, re.DOTALL):
+                steps_block = match.group(1)
+                self.logger.debug(f"  Bloco steps encontrado: {steps_block[:100]}...")
+                
+                # Extrair cada step individual dentro do bloco
+                # O texto dentro pode ter escapes como \"
+                # Precisamos capturar: Given the date is \"2014 Feb 5th 7:05am\"
+                
+                # Primeiro, vamos tentar encontrar padrões mais específicos
+                # Formato 1: Given "texto com \" escapes"
+                # Formato 2: Given 'texto'
+                # Formato 3: Given /regex/
+                
+                # Usar regex mais robusto que captura texto entre aspas com escapes
+                step_patterns = [
+                    # Captura: Given "texto com \" dentro"
+                    r'(?:Given|When|Then|And|But)\s+"([^"\\]*(?:\\.[^"\\]*)*)"',
+                    # Captura: Given 'texto'
+                    r"(?:Given|When|Then|And|But)\s+'([^'\\]*(?:\\.[^'\\]*)*)'",
+                    # Captura sem aspas mas preservando estrutura
+                    r'(?:Given|When|Then|And|But)\s+(.+?)(?=\s+(?:Given|When|Then|And|But)|$)',
+                ]
+                
+                for step_pattern in step_patterns:
+                    for step_match in re.finditer(step_pattern, steps_block, re.DOTALL):
+                        step_text = step_match.group(1).strip()
+                        
+                        # Remover quebras de linha e espaços extras
+                        step_text = re.sub(r'\s+', ' ', step_text).strip()
+                        
+                        if step_text:
+                            # Unescape: converter \" para "
+                            step_text_unescaped = step_text.replace('\\"', '"').replace("\\'", "'")
+                            
+                            references.append(step_text_unescaped)
+                            self.logger.debug(f"    ✓ Referência encontrada: '{step_text_unescaped}'")
+        
+        self.logger.debug(f"  Total de {len(references)} referências encontradas")
+        return references
 
-    def normalize_step_text(self, step_text: str) -> str:
-        """Normaliza texto do step para comparação"""
-        if not step_text:
-            return ""
-        s = step_text
-        s = self.safe_unescape_backslash(s)
-        # replace parameter-like groups with placeholder
-        s = re.sub(r'\{[^}]+\}', '{param}', s)
-        s = re.sub(r'\([^)]*\)', '{param}', s)
-        s = re.sub(r'\\[wdsWDs]\+?', '{param}', s)
-        s = re.sub(r'\.\*', '{param}', s)
-        # strip punctuation that isn't meaningful but keep basic punctuation
-        s = re.sub(r'[^\w\s\{\}\-\/:;.,]', '', s)
-        s = re.sub(r'\s+', ' ', s).strip().lower()
-        return s
-
-    # -----------------------------
-    # Node.js advanced extraction
-    # -----------------------------
-    def extract_nodejs_step_definitions_advanced(self, content: str) -> List[str]:
+    def find_internal_step_references_js(self, method_body: str) -> List[str]:
         """
-        Extração avançada para Node.js/TypeScript com tratamento de aspas aninhadas.
-        Remove comentários primeiro e usa regex tolerante com escapes.
+        Encontra referências a outros steps dentro de um método JS/TS.
         """
-        if not content:
-            return []
+        references = []
+        
+        patterns = [
+            r'this\.\s*(?:Given|When|Then|And|But)\s*\(\s*["\'\`](.+?)["\'\`]',
+            r'await\s+this\.\s*(?:Given|When|Then|And|But)\s*\(\s*["\'\`](.+?)["\'\`]',
+        ]
+        
+        for pattern in patterns:
+            for match in re.finditer(pattern, method_body, re.DOTALL):
+                step_text = match.group(1)
+                references.append(step_text)
+                self.logger.debug(f"    -> Referência interna: '{step_text}'")
+        
+        return references
 
-        # Remove block comments and single-line comments for extraction
-        content = content.replace('\r\n', '\n').replace('\r', '\n')
-        content_clean = re.sub(r'/\*.*?\*/', lambda m: re.sub(r'[^\n]', ' ', m.group(0)), content, flags=re.DOTALL)
-        content_clean = re.sub(r'//.*?$', lambda m: ' ' * len(m.group(0)), content_clean, flags=re.MULTILINE)
-
-        step_defs = []
-        keywords = ['Given', 'When', 'Then', 'And', 'But', 'defineStep']
-
-        # Pattern for 'keyword( '...' , ' or )'
-        for keyword in keywords:
-            # capture quoted strings with proper escaping handling
-            pattern = rf'\b{keyword}\s*\(\s*(["\'])(?P<body>(?:(?:(?!\1).)|\\.)*?)\1\s*[,)\n]'
-            for m in re.finditer(pattern, content_clean, flags=re.DOTALL):
-                body = m.group('body') or ''
-                body = self.safe_unescape_backslash(body)
-                step_defs.append(body)
-
-        # template literals/backticks
-        for m in re.finditer(r'\b(?:Given|When|Then|And|But|defineStep)\s*\(\s*`(?P<body>[^`]*)`', content_clean, flags=re.DOTALL):
-            body = m.group('body') or ''
-            step_defs.append(body)
-
-        # regex literals
-        for m in re.finditer(r'\b(?:Given|When|Then|And|But|defineStep)\s*\(\s*/(?P<body>[^/]+)/[gimuy]*', content_clean):
-            body = m.group('body') or ''
-            step_defs.append(body)
-
-        return [self.safe_unescape_backslash(sd).strip() for sd in step_defs]
-
-    # -----------------------------
-    # Method boundary finders
-    # -----------------------------
-    def find_method_boundaries_jvm(self, lines: List[str], annotation_line: int, language: str, is_commented: bool = False) -> Tuple[int, int]:
+    def find_internal_step_references_jvm(self, method_body: str) -> List[str]:
         """
-        Encontra limites de método para Java/Kotlin/Scala (JVM)
-        - Suporta assinatura multilinha e modificadores em linhas anteriores.
-        - annotation_line is the line where the annotation was detected (0-based).
+        Encontra referências a outros steps dentro de um método JVM.
         """
+        references = []
+        
+        patterns = [
+            r'(?:executeStep|runStep|callStep)\s*\(\s*["\'](.+?)["\']',
+        ]
+        
+        for pattern in patterns:
+            for match in re.finditer(pattern, method_body, re.DOTALL):
+                step_text = match.group(1)
+                references.append(step_text)
+                self.logger.debug(f"    -> Referência interna: '{step_text}'")
+        
+        return references
+
+    def find_internal_step_references(self, method_body: str, language: str) -> List[str]:
+        """
+        Encontra referências a outros steps dentro de um método.
+        """
+        family = self.patterns[language]['language_family']
+        
+        if family == 'ruby':
+            return self.find_internal_step_references_ruby(method_body)
+        elif family == 'js':
+            return self.find_internal_step_references_js(method_body)
+        elif family == 'jvm':
+            return self.find_internal_step_references_jvm(method_body)
+        
+        return []
+
+    def find_method_boundaries_ruby(self, lines: List[str], step_line: int) -> Tuple[int, int]:
+        """Encontra os limites completos de um método Ruby."""
         n = len(lines)
-        # start searching from the annotation line forward to find the opening '{' of the method body
-        sig_start = None
-        brace_balance = 0
-        max_search = 200  # mais permissivo
-        # attempt to find the first line that looks like part of method signature (contains '(' )
-        for j in range(annotation_line + 1, min(n, annotation_line + 1 + max_search)):
-            line = lines[j]
-            if not line.strip():
-                continue
-            # ignore other annotations on consecutive lines
-            if line.strip().startswith('@'):
-                continue
-            # If line contains '(' consider it's signature start
-            if '(' in line:
-                sig_start = j
-                # From sig_start, search until we find an opening brace '{' and then match closing brace.
-                for k in range(sig_start, min(n, sig_start + max_search)):
-                    current = lines[k]
-                    # Count braces but ignore braces inside quotes naive approach: remove quoted parts
-                    tmp = re.sub(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'', '', current)
-                    brace_balance += tmp.count('{') - tmp.count('}')
-                    if '{' in tmp:
-                        # found start of body; now find matching closing brace
-                        if brace_balance <= 0:
-                            return sig_start, k
-                        for m in range(k + 1, n):
-                            cur2 = lines[m]
-                            tmp2 = re.sub(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'', '', cur2)
-                            brace_balance += tmp2.count('{') - tmp2.count('}')
-                            if brace_balance <= 0:
-                                return sig_start, m
-                        return -1, -1
-                break
-
-        # fallback: try to find a block starting with '{' after annotation_line
-        for j in range(annotation_line + 1, min(n, annotation_line + 1 + max_search)):
-            if '{' in lines[j]:
-                # find matching brace
-                brace_balance = lines[j].count('{') - lines[j].count('}')
-                for k in range(j + 1, n):
-                    brace_balance += lines[k].count('{') - lines[k].count('}')
-                    if brace_balance <= 0:
-                        # choose method_start as annotation_line+1 (best-effort)
-                        method_start_line = annotation_line + 1
-                        return method_start_line, k
+        method_start = step_line
+        
+        for i in range(step_line, min(n, step_line + 3)):
+            line = lines[i]
+            
+            if re.search(r'\bdo\b', line):
+                depth = 1
+                for j in range(i + 1, n):
+                    current_line = lines[j]
+                    depth += len(re.findall(r'\bdo\b', current_line))
+                    depth -= len(re.findall(r'\bend\b', current_line))
+                    if depth <= 0:
+                        return method_start, j
                 return -1, -1
-
+            
+            elif '{' in line:
+                brace_count = line.count('{') - line.count('}')
+                if brace_count == 0:
+                    return method_start, i
+                for j in range(i + 1, n):
+                    brace_count += lines[j].count('{') - lines[j].count('}')
+                    if brace_count <= 0:
+                        return method_start, j
+                return -1, -1
+        
         return -1, -1
 
-    def find_method_boundaries_ruby(self, lines: List[str], annotation_line: int) -> Tuple[int, int]:
-        """
-        Encontra limites de método para Ruby: suporta 'do...end' e '{...}'.
-        """
+    def find_method_boundaries_js(self, lines: List[str], step_line: int) -> Tuple[int, int]:
+        """Encontra os limites completos de uma função JS/TS."""
         n = len(lines)
-        method_start = annotation_line
-        # procurar 'do' ou '{' nas próximas linhas (até um limite)
-        for j in range(annotation_line, min(n, annotation_line + 10)):
-            line = lines[j]
-            if ' do' in line or line.strip().endswith('do') or line.strip().startswith('do'):
-                # find matching 'end'
-                depth = 0
-                for k in range(j, n):
-                    cur = lines[k]
-                    # count do and end occurrences na forma simples (heurística)
-                    depth += len(re.findall(r'\bdo\b', cur)) - len(re.findall(r'\bend\b', cur))
-                    if depth <= 0 and re.search(r'\bend\b', cur):
-                        return method_start, k
-                return -1, -1
+        method_start = step_line
+        brace_count = 0
+        
+        for i in range(step_line, min(n, step_line + 10)):
+            line = lines[i]
             if '{' in line:
-                brace_balance = line.count('{') - line.count('}')
-                if brace_balance <= 0:
-                    return method_start, j
-                for k in range(j + 1, n):
-                    brace_balance += lines[k].count('{') - lines[k].count('}')
-                    if brace_balance <= 0:
-                        return method_start, k
+                brace_count += line.count('{') - line.count('}')
+                if brace_count == 0:
+                    return method_start, i
+                for j in range(i + 1, n):
+                    current = lines[j]
+                    brace_count += current.count('{') - current.count('}')
+                    if brace_count <= 0:
+                        return method_start, j
                 return -1, -1
         return -1, -1
 
-    def find_method_boundaries_js(self, lines: List[str], annotation_line: int) -> Tuple[int, int]:
-        """
-        Encontra limites de função para JS/TS: () => { ... }, function ... { ... }
-        """
+    def find_method_boundaries_jvm(self, lines: List[str], step_line: int) -> Tuple[int, int]:
+        """Encontra os limites completos de um método JVM."""
         n = len(lines)
-        method_start = annotation_line
-        brace_balance = 0
-        found_start = False
-        max_search = 200
-        for j in range(annotation_line, min(n, annotation_line + max_search)):
-            line = lines[j]
+        method_start = step_line
+        brace_count = 0
+        
+        for i in range(step_line, min(n, step_line + 15)):
+            line = lines[i]
             stripped = line.strip()
-            if stripped.startswith('//') or stripped.startswith('/*'):
+            if not stripped or stripped.startswith('@'):
                 continue
-            if 'function' in stripped or '=>' in stripped or 'async' in stripped:
-                found_start = True
-            if '{' in stripped:
-                brace_balance += stripped.count('{') - stripped.count('}')
-                if brace_balance <= 0:
-                    return method_start, j
-                for k in range(j + 1, n):
-                    brace_balance += lines[k].count('{') - lines[k].count('}')
-                    if brace_balance <= 0:
-                        return method_start, k
+            if '{' in line:
+                cleaned = re.sub(r'"[^"]*"', '', line)
+                cleaned = re.sub(r"'[^']*'", '', cleaned)
+                brace_count = cleaned.count('{') - cleaned.count('}')
+                if brace_count == 0:
+                    return method_start, i
+                for j in range(i + 1, n):
+                    current = lines[j]
+                    cleaned = re.sub(r'"[^"]*"', '', current)
+                    cleaned = re.sub(r"'[^']*'", '', cleaned)
+                    brace_count += cleaned.count('{') - cleaned.count('}')
+                    if brace_count <= 0:
+                        return method_start, j
                 return -1, -1
         return -1, -1
 
-    def find_method_boundaries(self, lines: List[str], annotation_line: int, language: str, is_commented: bool = False) -> Tuple[int, int]:
-        """
-        Dispatcher para família de linguagens
-        """
+    def find_method_boundaries(self, lines: List[str], step_line: int, language: str) -> Tuple[int, int]:
+        """Dispatcher para encontrar limites de método."""
         if language not in self.patterns:
             return -1, -1
-        fam = self.patterns[language].get('language_family', 'unknown')
-        if fam == 'jvm':
-            return self.find_method_boundaries_jvm(lines, annotation_line, language, is_commented)
-        if fam == 'ruby':
-            return self.find_method_boundaries_ruby(lines, annotation_line)
-        if fam == 'js':
-            return self.find_method_boundaries_js(lines, annotation_line)
+        family = self.patterns[language]['language_family']
+        if family == 'ruby':
+            return self.find_method_boundaries_ruby(lines, step_line)
+        elif family == 'js':
+            return self.find_method_boundaries_js(lines, step_line)
+        elif family == 'jvm':
+            return self.find_method_boundaries_jvm(lines, step_line)
         return -1, -1
 
-    # -----------------------------
-    # Main extraction logic
-    # -----------------------------
     def extract_step_definitions(self, code: str, language: str) -> List[Dict]:
         """
-        Extrai step definitions do código, retornando uma lista com:
-        { step_type, step_text, normalized_step, annotation_line, start_line, end_line, is_commented }
+        Extrai todos os step definitions do código fonte.
         """
         if not code:
             return []
-
+        
         language = language.lower()
         if language not in self.patterns:
+            self.logger.error(f"Linguagem não suportada: {language}")
             return []
-
-        # Prepare lines and masked content to avoid matching inside strings or block comments
+        
         lines = code.replace('\r\n', '\n').replace('\r', '\n').splitlines()
-        masked = self._mask_block_comments_and_strings(code)
-        masked_lines = masked.splitlines()
-
-        patt = self.patterns[language]['step_annotation']
         extracted = []
-        n = len(lines)
-
-        for i in range(len(masked_lines)):
-            line = masked_lines[i]
-            try:
-                m = re.search(patt, line)
-            except re.error:
-                self.logger.error(f"Regex error for pattern on line {i}: {patt}")
+        
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped.startswith('//') or stripped.startswith('#'):
                 continue
-            if not m:
+            
+            if not re.search(r'\b(Given|When|Then|And|But|defineStep)\b', line):
                 continue
-
-            # determine if original line was commented (for JVM comments like //)
-            original_line = lines[i] if i < n else ''
-            is_commented = original_line.strip().startswith('//')
-
-            step_type = None
-            # first capture group should be step type in our patterns
-            try:
-                step_type = m.group(1)
-            except Exception:
-                step_type = m.group(1) if m.groups() else None
-
-            # extract step text from several possible capture groups (choose first non-empty)
-            step_text = None
-            for gi in range(2, (m.lastindex or 1) + 1):
-                try:
-                    g = m.group(gi)
-                except Exception:
-                    g = None
-                if g:
-                    step_text = g
-                    break
-
-            # fallback: try to capture quoted content in the original line if nothing found
-            if step_text is None:
-                qmatch = re.search(r'["\'`]\s*(?P<body>(?:\\.|[^"\'`\\])*)\s*["\'`]', original_line)
-                if qmatch:
-                    step_text = qmatch.group('body')
-
-            if step_text is None:
-                self.logger.debug(f"Não foi possível extrair texto do step na linha {i}: {original_line!r}")
+            
+            pattern = self.extract_step_pattern(line, language)
+            if not pattern:
                 continue
-
-            # find method boundaries using original lines (not masked) to keep indexes correct
-            start_line, end_line = self.find_method_boundaries(lines, i, language, is_commented)
-
-            if start_line != -1 and end_line != -1:
-                actual_start = min(i, start_line) if is_commented else start_line
-                extracted.append({
-                    'step_type': step_type,
-                    'step_text': step_text,
-                    'normalized_step': self.normalize_step_text(step_text),
-                    'annotation_line': i,
-                    'start_line': actual_start,
-                    'end_line': end_line,
-                    'is_commented': is_commented
-                })
+            
+            step_type_match = re.search(r'\b(Given|When|Then|And|But|defineStep)\b', line)
+            step_type = step_type_match.group(1) if step_type_match else 'Unknown'
+            
+            start_line, end_line = self.find_method_boundaries(lines, i, language)
+            if start_line == -1 or end_line == -1:
+                self.logger.warning(f"Não foi possível encontrar limites para linha {i}: {pattern}")
+                continue
+            
+            # Extrair corpo do método
+            method_body = '\n'.join(lines[start_line:end_line + 1])
+            
+            # Detectar referências internas
+            self.logger.debug(f"\n{'='*60}")
+            self.logger.debug(f"Analisando step: {step_type} '{pattern}'")
+            internal_references = self.find_internal_step_references(method_body, language)
+            
+            extracted.append({
+                'step_type': step_type,
+                'step_pattern': pattern,
+                'step_pattern_normalized': self.normalize_pattern_for_matching(pattern),
+                'annotation_line': i,
+                'start_line': start_line,
+                'end_line': end_line,
+                'internal_references': internal_references,
+                'internal_references_normalized': [
+                    self.normalize_pattern_for_matching(ref) 
+                    for ref in internal_references
+                ]
+            })
+            
+            if internal_references:
+                self.logger.info(f"✓ Extraído: {step_type} '{pattern}' com {len(internal_references)} referências")
             else:
-                self.logger.warning(f"Não encontrou método correspondente para step '{step_text}' (linha {i})")
-
-        self.logger.debug(f"Extraídos {len(extracted)} step definitions ({language})")
+                self.logger.debug(f"✓ Extraído: {step_type} '{pattern}'")
+        
+        self.logger.info(f"\nTotal de {len(extracted)} step definitions extraídos")
         return extracted
 
-    # -----------------------------
-    # Remove excess steps
-    # -----------------------------
-    def remove_excess_steps(self, code: str, language: str, excess_steps: List[List[str]]) -> Tuple[str, List[str], List[List[str]]]:
+    def remove_excess_steps(self, code: str, language: str, excess_steps: List) -> Tuple[str, List[str], List]:
         """
         Remove step definitions excedentes do código.
-        - excess_steps: lista de pares [tipo, texto] (como vindo do analisador)
-        Retorna: (cleaned_code, removed_methods_list, remaining_excess_steps)
+        PROTEGE steps que são referenciados internamente por QUALQUER outro step.
+        PROTEGE steps que contêm substeps NÃO marcados para remoção.
         """
-        if language is None:
-            raise ValueError("Linguagem é None")
-        lang = language.lower()
-        if lang not in self.patterns:
+        if not code or not excess_steps:
+            return code, [], excess_steps
+        
+        language = language.lower()
+        if language not in self.patterns:
             raise ValueError(f"Linguagem não suportada: {language}")
-
-        if code is None:
-            return "", [], excess_steps or []
-
-        lines = code.replace('\r\n', '\n').replace('\r', '\n').splitlines()
-        original_line_count = len(lines)
-        if original_line_count == 0:
-            return code, [], excess_steps or []
-
-        # Extract defs
-        step_defs = self.extract_step_definitions(code, lang)
-
-        # build set of normalized excess texts for quick lookup
-        normalized_excess = {}
-        if excess_steps:
-            for es in excess_steps:
-                # es can be [type, text] or just text
-                try:
-                    txt = es[1] if isinstance(es, (list, tuple)) and len(es) > 1 else (es if isinstance(es, str) else str(es))
-                except Exception:
-                    txt = str(es)
-                norm = self.normalize_step_text(txt)
-                normalized_excess.setdefault(norm, []).append(txt)
-
+        
+        self.logger.info(f"\n{'='*80}")
+        self.logger.info(f"INICIANDO REMOÇÃO DE STEP DEFINITIONS EXCEDENTES")
+        self.logger.info(f"{'='*80}")
+        self.logger.info(f"Linguagem: {language}")
+        self.logger.info(f"Steps excedentes: {len(excess_steps)}")
+        
+        # Extrair todos os step definitions
+        all_step_defs = self.extract_step_definitions(code, language)
+        
+        if not all_step_defs:
+            self.logger.warning("Nenhum step definition encontrado no código")
+            return code, [], excess_steps
+        
+        # Criar conjunto de patterns excedentes normalizados
+        excess_patterns_normalized = {}
+        for excess in excess_steps:
+            if isinstance(excess, (list, tuple)) and len(excess) >= 2:
+                pattern = excess[1]
+            elif isinstance(excess, str):
+                pattern = excess
+            else:
+                continue
+            
+            pattern_normalized = self.normalize_pattern_for_matching(pattern)
+            excess_patterns_normalized[pattern_normalized] = excess
+            self.logger.debug(f"Excess: '{pattern}' -> Normalizado: '{pattern_normalized}'")
+        
+        self.logger.info(f"\n{'='*80}")
+        self.logger.info(f"ANÁLISE DE DEPENDÊNCIAS")
+        self.logger.info(f"{'='*80}")
+        
+        # Construir conjunto de patterns protegidos
+        protected_patterns: Set[str] = set()
+        protection_reasons = {}
+        
+        # REGRA 1: Proteger steps que são referenciados por outros steps
+        for step_def in all_step_defs:
+            pattern_normalized = step_def['step_pattern_normalized']
+            internal_refs = step_def['internal_references_normalized']
+            
+            if internal_refs:
+                self.logger.info(f"\n📦 Step '{pattern_normalized}' referencia {len(internal_refs)} outros steps:")
+                
+                for ref in internal_refs:
+                    protected_patterns.add(ref)
+                    protection_reasons[ref] = f"Referenciado por: '{pattern_normalized}'"
+                    self.logger.info(f"  🔒 Protegendo: '{ref}'")
+        
+        # REGRA 2: Proteger steps que referenciam substeps NÃO marcados para remoção
+        self.logger.info(f"\n{'='*80}")
+        self.logger.info(f"ANÁLISE DE SUBSTEPS NÃO MARCADOS PARA REMOÇÃO")
+        self.logger.info(f"{'='*80}")
+        
+        for step_def in all_step_defs:
+            pattern_normalized = step_def['step_pattern_normalized']
+            pattern_original = step_def['step_pattern']
+            internal_refs = step_def['internal_references_normalized']
+            
+            # Se este step está marcado para remoção E tem substeps
+            if pattern_normalized in excess_patterns_normalized and internal_refs:
+                self.logger.info(f"\n🔍 Analisando substeps de '{pattern_original}':")
+                
+                has_non_excess_substep = False
+                non_excess_substeps = []
+                
+                for ref in internal_refs:
+                    # Verificar se este substep NÃO está na lista de excess
+                    if ref not in excess_patterns_normalized:
+                        has_non_excess_substep = True
+                        non_excess_substeps.append(ref)
+                        self.logger.info(f"  ✓ Substep NÃO marcado para remoção: '{ref}'")
+                    else:
+                        self.logger.info(f"  ✗ Substep marcado para remoção: '{ref}'")
+                
+                # Se tem pelo menos um substep não marcado para remoção, proteger o step principal
+                if has_non_excess_substep:
+                    protected_patterns.add(pattern_normalized)
+                    protection_reasons[pattern_normalized] = f"Contém {len(non_excess_substeps)} substep(s) não marcado(s) para remoção"
+                    self.logger.info(f"  🛡️  PROTEGENDO step principal '{pattern_original}'")
+                    self.logger.info(f"     Razão: Contém substeps que devem ser mantidos")
+        
+        if protected_patterns:
+            self.logger.info(f"\n✅ Total de {len(protected_patterns)} patterns protegidos")
+            self.logger.info(f"\nResumo das proteções:")
+            for pattern in protected_patterns:
+                reason = protection_reasons.get(pattern, 'Motivo desconhecido')
+                self.logger.info(f"  🛡️  '{pattern}' - {reason}")
+        else:
+            self.logger.info(f"\n⚠️ Nenhum pattern protegido encontrado")
+        
+        self.logger.info(f"\n{'='*80}")
+        self.logger.info(f"DECISÕES DE REMOÇÃO")
+        self.logger.info(f"{'='*80}")
+        
+        # Identificar steps a serem removidos
         lines_to_remove = set()
         removed_methods = []
-        removed_excess_originals = []
-
-        for sd in step_defs:
-            norm = sd.get('normalized_step') or self.normalize_step_text(sd.get('step_text'))
-            if norm in normalized_excess:
-                # mark lines for removal from start to end inclusive
-                s = sd['start_line']
-                e = sd['end_line']
-                if s is None or e is None or s < 0 or e < 0:
-                    # skip if invalid boundaries
-                    self.logger.warning(f"Ignorando step com limites inválidos: {sd}")
-                    continue
-                for i in range(s, e + 1):
-                    lines_to_remove.add(i)
-                removed_methods.append(f"{sd.get('step_type')}: \"{sd.get('step_text')}\"")
-                # pick one original excess text as removed for bookkeeping (pop-style)
-                originals = normalized_excess.get(norm)
-                if originals:
-                    removed_excess_originals.append(originals.pop(0))
-                self.logger.info(f"  MARCADO PARA REMOÇÃO: {sd.get('step_type')}: \"{sd.get('step_text')}\" (linhas {s}-{e})")
-            else:
-                self.logger.debug(f"  MANTIDO: {sd.get('step_type')}: \"{sd.get('step_text')}\"")
-
-        # If nothing to remove, return original
+        matched_patterns = set()
+        protected_count = 0
+        
+        for step_def in all_step_defs:
+            pattern_original = step_def['step_pattern']
+            pattern_normalized = step_def['step_pattern_normalized']
+            
+            if pattern_normalized in excess_patterns_normalized:
+                if pattern_normalized in protected_patterns:
+                    protected_by = protection_reasons.get(pattern_normalized, 'unknown')
+                    self.logger.info(f"\n✓ MANTER (protegido): '{pattern_original}'")
+                    self.logger.info(f"  Razão: {protected_by}")
+                    protected_count += 1
+                else:
+                    for line_num in range(step_def['start_line'], step_def['end_line'] + 1):
+                        lines_to_remove.add(line_num)
+                    
+                    removed_methods.append(f"{step_def['step_type']}: \"{pattern_original}\"")
+                    matched_patterns.add(pattern_normalized)
+                    
+                    self.logger.info(f"\n✗ REMOVER: '{pattern_original}'")
+                    self.logger.info(f"  Linhas: {step_def['start_line']}-{step_def['end_line']}")
+        
+        # Verificar patterns não encontrados
+        not_found = set(excess_patterns_normalized.keys()) - matched_patterns - protected_patterns
+        if not_found:
+            self.logger.warning(f"\n⚠️ {len(not_found)} patterns NÃO ENCONTRADOS:")
+            for nf in not_found:
+                self.logger.warning(f"  - '{nf}'")
+        
         if not lines_to_remove:
-            self.logger.info("Nenhuma linha marcada para remoção.")
-            return code, [], excess_steps or []
-
-        # Create cleaned lines preserving lines not removed
-        cleaned_lines = [line for idx, line in enumerate(lines) if idx not in lines_to_remove]
-
-        # Heurística: se remoção deixou múltiplas quebras de linha, colapsar múltiplas vazias
-        cleaned_code = "\n".join(cleaned_lines)
-        cleaned_code = re.sub(r'\n{3,}', '\n\n', cleaned_code).strip()
-
-        # Preserve final newline if original had
-        if code.endswith('\n') and cleaned_code and not cleaned_code.endswith('\n'):
+            self.logger.info("\n⚠️ Nenhuma linha marcada para remoção")
+            return code, [], excess_steps
+        
+        # Criar código limpo
+        lines = code.replace('\r\n', '\n').replace('\r', '\n').splitlines()
+        cleaned_lines = [line for i, line in enumerate(lines) if i not in lines_to_remove]
+        
+        cleaned_code = '\n'.join(cleaned_lines)
+        cleaned_code = re.sub(r'\n{3,}', '\n\n', cleaned_code)
+        
+        if code.endswith('\n') and not cleaned_code.endswith('\n'):
             cleaned_code += '\n'
-
-        # remaining excess steps: filter originals list by those not removed (if same structure)
-        remaining_excess = []
-        if excess_steps:
-            # build a normalized set of removed originals
-            removed_norms = set(self.normalize_step_text(x) for x in removed_excess_originals)
-            for es in excess_steps:
-                try:
-                    txt = es[1] if isinstance(es, (list, tuple)) and len(es) > 1 else (es if isinstance(es, str) else str(es))
-                except Exception:
-                    txt = str(es)
-                if self.normalize_step_text(txt) not in removed_norms:
-                    remaining_excess.append(es)
-        else:
-            remaining_excess = []
-
-        self.logger.info(f"Linhas removidas: {original_line_count - len(cleaned_code.splitlines()) if cleaned_code else original_line_count}")
+        
+        remaining_excess = [
+            excess_patterns_normalized[pn] 
+            for pn in excess_patterns_normalized 
+            if pn not in matched_patterns
+        ]
+        
+        self.logger.info(f"\n{'='*80}")
+        self.logger.info(f"RESULTADO FINAL")
+        self.logger.info(f"{'='*80}")
+        self.logger.info(f"Linhas originais: {len(lines)}")
+        self.logger.info(f"Linhas removidas: {len(lines) - len(cleaned_lines)}")
+        self.logger.info(f"Linhas finais: {len(cleaned_lines)}")
         self.logger.info(f"Métodos removidos: {len(removed_methods)}")
-        self.logger.info(f"Steps excedentes restantes: {len(remaining_excess)}")
-
+        self.logger.info(f"Steps protegidos: {protected_count}")
+        self.logger.info(f"Steps restantes na lista: {len(remaining_excess)}")
+        self.logger.info(f"{'='*80}\n")
+        
         return cleaned_code, removed_methods, remaining_excess
